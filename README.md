@@ -13,7 +13,7 @@ The pipeline has three stages, each exposed as a CLI subcommand:
 
 1. **Beamform** a neutral demodulated-IQ ultratrace into a beamformed H5
    (`acquisitions/<id>/meta/compound_image` plus a saved imaging grid), using
-   the optional `mach` GPU kernel. No vendor raw-frame decoding.
+   the optional `mach` CUDA kernel or `mlx` Apple Silicon backend. No vendor raw-frame decoding.
 2. **Track** — temporal SVD clutter filtering → 3D detection and sub-voxel
    localization → Kalman + Hungarian track linking → smoothing.
 3. **View** — export compact binary tracks for the animated 3D **track viewer**,
@@ -28,6 +28,7 @@ This project uses [uv](https://docs.astral.sh/uv/). From the repo root:
 ```bash
 uv sync                 # core: download + tracking + viewers (creates .venv)
 uv sync --extra mach    # + GPU MACH beamforming (CUDA host only)
+uv sync --extra mlx     # + MLX/Metal beamforming (Apple Silicon)
 ```
 
 `uv sync` installs the exact, locked versions (`uv.lock`). Run any command with
@@ -35,7 +36,8 @@ uv sync --extra mach    # + GPU MACH beamforming (CUDA host only)
 `source .venv/bin/activate` and call `ultratrace-ulm` directly.
 
 The core install has no GPU dependency. Beamforming (`beamform`, and the
-beamform step of `run`) needs the `mach` extra and a CUDA host.
+beamform step of `run`) needs either the `mach` extra on a CUDA host or the
+`mlx` extra on Apple Silicon.
 
 ## Quick start
 
@@ -53,7 +55,7 @@ Already have a beamformed file? Skip download and beamforming:
 ultratrace-ulm run --beamformed beamformed.h5 --frame-rate 222
 ```
 
-> `run` downloads ~98 GB and beamforms on a CUDA GPU. To avoid both, pass
+> `run` downloads ~98 GB and beamforms on a GPU backend. To avoid both, pass
 > `--beamformed`. For full control over any stage, use the dedicated
 > subcommands below instead.
 
@@ -65,7 +67,7 @@ Run `ultratrace-ulm <command> --help` for the complete flag list of any command.
 | --- | --- |
 | `download` | Fetch the public sample ultratrace (resumable). |
 | `run` | End-to-end demo: download → beamform → track → track viewer. |
-| `beamform` | MACH beamform a raw neutral ultratrace into a beamformed H5. |
+| `beamform` | Beamform a raw neutral ultratrace into a beamformed H5 with MACH/CUDA or MLX. |
 | `track` | Streaming ULM tracking → smoothed tracks (+ optional bins). |
 | `track-export` | `track` plus binary `.bin` export in one step. |
 | `export` | Smooth and export `.bin` files from an existing track pickle. |
@@ -115,11 +117,14 @@ and the `viewer/` bundle. Stages whose outputs already exist are skipped unless
 ultratrace-ulm beamform \
   --input sample_ultratrace.h5 \
   --output beamformed.h5 \
+  --backend mlx \
   --spatial-tgc
 ```
 
 Beamform a slice with `--acq-start` / `--num-acqs` / `--acq-step`, or the whole
-file with `--all-acqs`. Requires the `[mach]` extra and a CUDA GPU.
+file with `--all-acqs`. Use `--backend auto` (default) to prefer MACH/CUDA when
+available and fall back to MLX; use `--backend mach` or `--backend mlx` to force
+one backend.
 
 ### track
 

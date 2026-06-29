@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .beamform_core import BEAMFORM_BACKENDS
 from .beamform_mach import beamform_mach, make_options as make_beamform_options
 from .download import SAMPLE_FILENAME, SAMPLE_URL, download_sample
 from .tracking import (
@@ -37,6 +38,15 @@ def add_beamform_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tgc-acqs", type=int, default=12)
     parser.add_argument("--tgc-sigma-lambda", type=float, default=9.0)
     parser.add_argument("--tgc-svd-cut", type=float, default=0.05)
+    parser.add_argument(
+        "--backend",
+        choices=BEAMFORM_BACKENDS,
+        default="auto",
+        help="Beamforming backend. 'auto' prefers MACH/CUDA when available, then MLX.",
+    )
+    parser.add_argument("--mlx-scan-chunk", type=int, default=2048)
+    parser.add_argument("--mlx-rx-chunk", type=int, default=128)
+    parser.add_argument("--mlx-frame-chunk", type=int, default=16)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
 
@@ -170,6 +180,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 tgc_acqs=12,
                 tgc_sigma_lambda=9.0,
                 tgc_svd_cut=0.05,
+                backend=args.beamform_backend,
+                mlx_scan_chunk=args.mlx_scan_chunk,
+                mlx_rx_chunk=args.mlx_rx_chunk,
+                mlx_frame_chunk=args.mlx_frame_chunk,
                 resume=False,
                 dry_run=False,
             )
@@ -307,6 +321,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--frame-rate", dest="frame_rate", type=float, default=222.0)
     p.add_argument("--svd-method", choices=["fast", "full", "adaptive", "none"], default="adaptive")
     p.add_argument("--spatial-tgc", action="store_true", help="Spatial TGC during beamforming.")
+    p.add_argument(
+        "--beamform-backend",
+        choices=BEAMFORM_BACKENDS,
+        default="auto",
+        help="Beamforming backend for raw input. 'auto' prefers MACH/CUDA when available, then MLX.",
+    )
+    p.add_argument("--mlx-scan-chunk", type=int, default=2048)
+    p.add_argument("--mlx-rx-chunk", type=int, default=128)
+    p.add_argument("--mlx-frame-chunk", type=int, default=16)
     p.add_argument("--min-length", type=int, default=35, help="Min track length for the viewer.")
     p.add_argument("--export-min-lengths", type=int, nargs="+", default=[5, 20, 50])
     p.add_argument("--acq-start", type=int, default=None)

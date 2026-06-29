@@ -1,18 +1,19 @@
-"""Standalone MACH beamforming core for neutral ultratrace data.
+"""Standalone beamforming core for neutral ultratrace data.
 
 This module is a sanitized, dependency-free port of the pieces of the reference
 imaging stack required to beamform demodulated IQ data with the
-``mach`` CUDA kernel. It deliberately contains NO external imaging-SDK import and
-does NOT decode raw frames -- it consumes the neutral ultratrace schema
-written by ``export_neutral_ultratrace.py`` (see that converter / the README for
-the schema).
+``mach`` CUDA kernel, plus a native MLX backend for Apple Silicon. It
+deliberately contains NO external imaging-SDK import and does NOT decode raw
+frames -- it consumes the neutral ultratrace schema written by
+``export_neutral_ultratrace.py`` (see that converter / the README for the
+schema).
 
 The numerics here mirror the reference:
   * ``imaging/preprocess.py``                  -> :func:`preprocess`
   * ``imaging/beamform.py::compute_grid_params`` /
     ``BeamformingParameters.create`` grid math -> :func:`build_grid`
   * ``imaging/beamform.py::_prepare_tx_delays_for_row`` -> :func:`prepare_tx_delays_for_row`
-  * ``imaging/mach_beamform.py``               -> :func:`beamform_iq`
+  * ``imaging/mach_beamform.py``               -> :func:`beamform_iq_mach`
   * ``misc/ulm/beamform_tgc_n4.py``            -> :func:`compute_global_tgc`
 """
 
@@ -31,6 +32,49 @@ try:  # pragma: no cover - exercised only on GPU hosts
 except Exception:  # noqa: BLE001 - any import failure means mach is unavailable
     _mach_beamform = None
     MACH_AVAILABLE = False
+
+# MLX is an optional Apple Silicon backend. Guard the import for the same reason
+# as MACH: tracking/viewer imports should work without any GPU package installed.
+try:  # pragma: no cover - import availability depends on host platform
+    import mlx.core as _mx
+
+    MLX_AVAILABLE = True
+except Exception:  # noqa: BLE001 - any import failure means mlx is unavailable
+    _mx = None
+    MLX_AVAILABLE = False
+
+BEAMFORM_BACKENDS = ("auto", "mach", "mlx")
+
+
+def resolve_beamform_backend(backend: str = "mach") -> str:
+    """Resolve ``auto`` and validate requested beamforming backend."""
+    backend = backend.lower()
+    if backend not in BEAMFORM_BACKENDS:
+        choices = ", ".join(BEAMFORM_BACKENDS)
+        raise ValueError(f"Unknown beamforming backend '{backend}'. Choose one of: {choices}")
+    if backend == "auto":
+        if MACH_AVAILABLE:
+            return "mach"
+        if MLX_AVAILABLE:
+            return "mlx"
+        raise ImportError(
+            "No beamforming backend is available. Install the CUDA backend with "
+            "pip install 'ultratrace-ulm-pipeline[mach]' or the Apple Silicon "
+            "backend with pip install 'ultratrace-ulm-pipeline[mlx]'."
+        )
+    if backend == "mach" and not MACH_AVAILABLE:
+        raise ImportError(
+            "mach is not importable. MACH beamforming requires the GPU-only "
+            "'mach-beamform' package. Install with: pip install "
+            "'ultratrace-ulm-pipeline[mach]'"
+        )
+    if backend == "mlx" and not MLX_AVAILABLE:
+        raise ImportError(
+            "mlx is not importable. MLX beamforming requires Apple Silicon/macOS "
+            "and the optional 'mlx' package. Install with: pip install "
+            "'ultratrace-ulm-pipeline[mlx]'"
+        )
+    return backend
 
 
 # --------------------------------------------------------------------------- #
@@ -264,7 +308,7 @@ def prepare_tx_delays_for_row(
 # --------------------------------------------------------------------------- #
 # MACH beamform (port of the reference MACH wrapper)
 # --------------------------------------------------------------------------- #
-def beamform_iq(
+def beamform_iq_mach(
     iq_frames: np.ndarray,  # (loops, angles, rows, cols, time) complex
     tx_delays: np.ndarray,  # (angles, channels) seconds
     tx_delays_elev: np.ndarray,  # (angles, rows) seconds
@@ -275,11 +319,7 @@ def beamform_iq(
     Returns ``(compound_image, grid)`` where compound_image is
     ``(frames, elev, z, x)`` complex64 and ``grid`` arrays are ``(z, elev, x)``.
     """
-    if not MACH_AVAILABLE:
-        raise ImportError(
-            "mach is not importable. MACH beamforming requires the GPU-only "
-            "'mach-beamform' package. Install with: pip install 'ultratrace-ulm-pipeline[mach]'"
-        )
+    resolve_beamform_backend("mach")
     import cupy as cp
 
     iq = preprocess(
@@ -378,6 +418,316 @@ def beamform_iq(
     compound = beamformed_all.sum(axis=0)  # (z, elev, x, F)
     compound = np.transpose(compound, (3, 1, 0, 2)).astype(np.complex64)  # (F, elev, z, x)
     return compound, grid
+
+
+# --------------------------------------------------------------------------- #
+# MLX beamform (Apple Silicon delay-and-sum backend)
+# --------------------------------------------------------------------------- #
+def _positive_int(value: int, name: str) -> int:
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1")
+    return value
+
+
+def _tukey_apodization_mlx(r_norm, tukey_alpha: float, mx):
+    """Half Tukey receive-apodization window matching the MACH CUDA kernel."""
+    if tukey_alpha <= 0.0:
+        return mx.ones(r_norm.shape, dtype=mx.float32)
+    flat = r_norm <= (1.0 - tukey_alpha)
+    taper = 0.5 - 0.5 * mx.cos(np.pi * (1.0 - r_norm) / tukey_alpha)
+    return mx.where(r_norm <= 1.0, mx.where(flat, 1.0, taper), 0.0)
+
+
+def _linear_interpolate_mlx(channel_data, sample_idx, valid, mx):
+    """Linear interpolation over channel_data's sample axis.
+
+    ``channel_data`` is ``(rx, samples, frames)`` and ``sample_idx`` is
+    ``(scan, rx)``. The result is ``(scan, rx, frames)``.
+    """
+    n_scan, n_rx = sample_idx.shape
+    _, n_samples, n_frames = channel_data.shape
+
+    sample_floor = mx.floor(sample_idx)
+    sample_ceil = mx.ceil(sample_idx)
+    idx0 = mx.clip(sample_floor, 0.0, float(n_samples - 1)).astype(mx.int32)
+    idx1 = mx.clip(sample_ceil, 0.0, float(n_samples - 1)).astype(mx.int32)
+    alpha = sample_idx - sample_floor
+
+    idx_shape = (n_scan, n_rx, 1, n_frames)
+    idx0 = mx.broadcast_to(idx0[:, :, None, None], idx_shape)
+    idx1 = mx.broadcast_to(idx1[:, :, None, None], idx_shape)
+    expanded = channel_data[None, :, :, :]
+    v0 = mx.take_along_axis(expanded, idx0, axis=2)
+    v1 = mx.take_along_axis(expanded, idx1, axis=2)
+    samples = mx.squeeze(v0 + (v1 - v0) * alpha[:, :, None, None], axis=2)
+    return mx.where(valid[:, :, None], samples, 0.0)
+
+
+def _compute_tx_arrivals_mlx(
+    rx_coords,
+    scan_coords,
+    tx_delays_full,
+    speed_of_sound_m_s: float,
+    receive_chunk: int,
+    mx,
+):
+    """Compute per-scan transmit-wave arrivals by min over emitting elements."""
+    n_scan = scan_coords.shape[0]
+    n_rx = rx_coords.shape[0]
+    inv_c = 1.0 / float(speed_of_sound_m_s)
+    arrivals = mx.full((n_scan,), np.inf, dtype=mx.float32)
+
+    for r0 in range(0, n_rx, receive_chunk):
+        r1 = min(r0 + receive_chunk, n_rx)
+        rx = rx_coords[r0:r1]
+        dist = mx.linalg.norm(rx[None, :, :] - scan_coords[:, None, :], axis=2)
+        candidate = dist * inv_c + tx_delays_full[r0:r1][None, :]
+        arrivals = mx.minimum(arrivals, mx.min(candidate, axis=1))
+        mx.eval(arrivals)
+
+    return arrivals
+
+
+def _beamform_single_transmit_mlx(
+    channel_data: np.ndarray,  # (rx, samples, frames) complex64
+    rx_coords_m: np.ndarray,  # (rx, 3) float32
+    scan_coords_m: np.ndarray,  # (scan, 3) float32
+    tx_wave_arrivals_s: np.ndarray,  # (scan,) float32
+    *,
+    rx_start_s: float,
+    sampling_freq_hz: float,
+    f_number: float,
+    sound_speed_m_s: float,
+    modulation_freq_hz: float,
+    tukey_alpha: float = 0.5,
+    scan_chunk: int = 2048,
+    receive_chunk: int = 128,
+    frame_chunk: int = 16,
+) -> np.ndarray:
+    """MLX delay-and-sum for one transmit angle.
+
+    The implementation mirrors MACH's linear-interpolation path:
+    dynamic F-number aperture, optional Tukey apodization, and complex IQ phase
+    correction by the physical transmit+receive travel time.
+    """
+    resolve_beamform_backend("mlx")
+    mx = _mx
+    assert mx is not None
+
+    scan_chunk = _positive_int(scan_chunk, "scan_chunk")
+    receive_chunk = _positive_int(receive_chunk, "receive_chunk")
+    frame_chunk = _positive_int(frame_chunk, "frame_chunk")
+
+    channel_np = np.ascontiguousarray(channel_data, dtype=np.complex64)
+    rx_coords_np = np.ascontiguousarray(rx_coords_m, dtype=np.float32)
+    scan_coords_np = np.ascontiguousarray(scan_coords_m, dtype=np.float32)
+    tx_arrivals_np = np.ascontiguousarray(tx_wave_arrivals_s, dtype=np.float32)
+
+    n_rx, n_samples, n_frames = channel_np.shape
+    n_scan = scan_coords_np.shape[0]
+    if rx_coords_np.shape != (n_rx, 3):
+        raise ValueError(f"rx_coords_m must have shape ({n_rx}, 3); got {rx_coords_np.shape}")
+    if scan_coords_np.shape != (n_scan, 3):
+        raise ValueError(f"scan_coords_m must have shape ({n_scan}, 3); got {scan_coords_np.shape}")
+    if tx_arrivals_np.shape != (n_scan,):
+        raise ValueError(
+            f"tx_wave_arrivals_s must have shape ({n_scan},); got {tx_arrivals_np.shape}"
+        )
+
+    rx_coords = mx.array(rx_coords_np, dtype=mx.float32)
+    scan_coords = mx.array(scan_coords_np, dtype=mx.float32)
+    tx_arrivals = mx.array(tx_arrivals_np, dtype=mx.float32)
+    out = np.zeros((n_scan, n_frames), dtype=np.complex64)
+
+    inv_c = 1.0 / float(sound_speed_m_s)
+    modulation_freq_rad = 2.0 * np.pi * float(modulation_freq_hz)
+    f_number = float(f_number) if f_number else 2.0
+
+    for s0 in range(0, n_scan, scan_chunk):
+        s1 = min(s0 + scan_chunk, n_scan)
+        scan = scan_coords[s0:s1]
+        scan_tx = tx_arrivals[s0:s1]
+        z = scan[:, 2]
+        aperture_radius = z / (2.0 * f_number)
+        aperture_radius_squared = aperture_radius * aperture_radius
+
+        for f0 in range(0, n_frames, frame_chunk):
+            f1 = min(f0 + frame_chunk, n_frames)
+            accum = mx.zeros((s1 - s0, f1 - f0), dtype=mx.complex64)
+
+            for r0 in range(0, n_rx, receive_chunk):
+                r1 = min(r0 + receive_chunk, n_rx)
+                rx = rx_coords[r0:r1]
+                ch = mx.array(channel_np[r0:r1, :, f0:f1], dtype=mx.complex64)
+
+                delta = rx[None, :, :] - scan[:, None, :]
+                horizontal_sq = delta[:, :, 0] * delta[:, :, 0] + delta[:, :, 1] * delta[:, :, 1]
+                inside = horizontal_sq <= aperture_radius_squared[:, None]
+                rx_distance = mx.sqrt(horizontal_sq + delta[:, :, 2] * delta[:, :, 2])
+                physical_tau = scan_tx[:, None] + rx_distance * inv_c
+                sample_idx = (physical_tau - float(rx_start_s)) * float(sampling_freq_hz)
+                valid = inside & (sample_idx >= 0.0) & (sample_idx <= float(n_samples - 1))
+
+                samples = _linear_interpolate_mlx(ch, sample_idx, valid, mx)
+                if tukey_alpha > 0.0:
+                    horizontal = mx.sqrt(mx.maximum(horizontal_sq, 0.0))
+                    r_norm = horizontal / aperture_radius[:, None]
+                    samples = samples * _tukey_apodization_mlx(r_norm, tukey_alpha, mx)[:, :, None]
+
+                if modulation_freq_hz:
+                    phase = mx.exp((1j * modulation_freq_rad) * physical_tau)
+                    samples = samples * phase[:, :, None]
+
+                accum = accum + mx.sum(samples, axis=1)
+                mx.eval(accum)
+
+            out[s0:s1, f0:f1] = np.array(accum)
+
+        mx.clear_cache()
+
+    return out
+
+
+def beamform_iq_mlx(
+    iq_frames: np.ndarray,  # (loops, angles, rows, cols, time) complex
+    tx_delays: np.ndarray,  # (angles, channels) seconds
+    tx_delays_elev: np.ndarray,  # (angles, rows) seconds
+    config: NeutralConfig,
+    *,
+    scan_chunk: int = 2048,
+    receive_chunk: int = 128,
+    frame_chunk: int = 16,
+) -> tuple[np.ndarray, Grid]:
+    """Beamform neutral IQ with an MLX delay-and-sum backend.
+
+    Returns ``(compound_image, grid)`` where compound_image is
+    ``(frames, elev, z, x)`` complex64 and ``grid`` arrays are ``(z, elev, x)``.
+    """
+    resolve_beamform_backend("mlx")
+    mx = _mx
+    assert mx is not None
+
+    iq = preprocess(
+        iq_frames,
+        config,
+        row_index=config.row_index,
+        mean_subtract_channels=config.mean_subtract_channels,
+    )
+    num_frames, num_angles, num_rows, num_cols, _ = iq.shape
+
+    grid = build_grid(config)
+
+    txd = prepare_tx_delays_for_row(
+        list(tx_delays), num_cols, row_index=config.row_index
+    )
+    txd_elev = np.asarray(tx_delays_elev, dtype=np.float64)
+    if config.row_index is not None and config.row_index >= 0:
+        txd_elev = txd_elev[:, [config.row_index]]
+    elif num_rows == 1:
+        txd_elev = txd_elev[:, [txd_elev.shape[1] // 2]]
+    elif txd_elev.shape[1] != num_rows:
+        if txd_elev.shape[1] > num_rows:
+            stride = max(1, txd_elev.shape[1] // num_rows)
+            txd_elev = txd_elev[:, ::stride][:, :num_rows]
+        else:
+            pad = np.zeros((txd_elev.shape[0], num_rows), dtype=np.float64)
+            pad[:, : txd_elev.shape[1]] = txd_elev
+            txd_elev = pad
+
+    x_channels = (np.arange(num_cols, dtype=np.float32) - (num_cols - 1) / 2) * config.element_pitch_x_m
+    y_rows = (np.arange(num_rows, dtype=np.float32) - (num_rows - 1) / 2) * config.element_pitch_y_m
+    rx_coords_np = np.stack(
+        (
+            np.tile(x_channels, num_rows),
+            np.repeat(y_rows, num_cols),
+            np.zeros(num_rows * num_cols, dtype=np.float32),
+        ),
+        axis=1,
+    ).astype(np.float32)
+
+    scan_coords_np = np.stack(
+        (grid.x.ravel(), grid.y.ravel(), grid.z.ravel()), axis=1
+    ).astype(np.float32)
+    n_scan = scan_coords_np.shape[0]
+
+    rx_coords_mx = mx.array(rx_coords_np, dtype=mx.float32)
+    scan_coords_mx = mx.array(scan_coords_np, dtype=mx.float32)
+    tx_delays_full_np = (
+        txd[:, np.newaxis, :] + txd_elev[:, :, np.newaxis]
+    ).reshape(txd.shape[0], -1).astype(np.float32)
+
+    compound_flat = np.zeros((n_scan, num_frames), dtype=np.complex64)
+    receive_chunk = _positive_int(receive_chunk, "receive_chunk")
+    scan_chunk = _positive_int(scan_chunk, "scan_chunk")
+    frame_chunk = _positive_int(frame_chunk, "frame_chunk")
+
+    for angle_idx in range(num_angles):
+        ch = iq[:, angle_idx, :, :, :].reshape(num_frames, num_rows * num_cols, -1)
+        ch = np.transpose(ch, (1, 2, 0)).astype(np.complex64, copy=False)
+        tx_full = mx.array(tx_delays_full_np[angle_idx], dtype=mx.float32)
+        tx_arrivals_np = np.empty(n_scan, dtype=np.float32)
+
+        for s0 in range(0, n_scan, scan_chunk):
+            s1 = min(s0 + scan_chunk, n_scan)
+            tx_arrivals = _compute_tx_arrivals_mlx(
+                rx_coords_mx,
+                scan_coords_mx[s0:s1],
+                tx_full,
+                config.speed_of_sound_m_s,
+                receive_chunk,
+                mx,
+            )
+            tx_arrivals_np[s0:s1] = np.array(tx_arrivals)
+
+        angle_out = _beamform_single_transmit_mlx(
+            ch,
+            rx_coords_np,
+            scan_coords_np,
+            tx_arrivals_np,
+            rx_start_s=config.rx_offset_s,
+            sampling_freq_hz=config.sampling_rate_hz,
+            f_number=config.f_number if config.f_number else 2.0,
+            sound_speed_m_s=config.speed_of_sound_m_s,
+            modulation_freq_hz=config.tx_freq_hz,
+            tukey_alpha=0.5,
+            scan_chunk=scan_chunk,
+            receive_chunk=receive_chunk,
+            frame_chunk=frame_chunk,
+        )
+        compound_flat += angle_out
+
+    compound = compound_flat.reshape(
+        grid.depth_pixels, grid.height_pixels, grid.width_pixels, num_frames
+    )
+    compound = np.transpose(compound, (3, 1, 0, 2)).astype(np.complex64)
+    return compound, grid
+
+
+def beamform_iq(
+    iq_frames: np.ndarray,  # (loops, angles, rows, cols, time) complex
+    tx_delays: np.ndarray,  # (angles, channels) seconds
+    tx_delays_elev: np.ndarray,  # (angles, rows) seconds
+    config: NeutralConfig,
+    *,
+    backend: str = "mach",
+    scan_chunk: int = 2048,
+    receive_chunk: int = 128,
+    frame_chunk: int = 16,
+) -> tuple[np.ndarray, Grid]:
+    """Beamform neutral IQ with the selected backend."""
+    resolved = resolve_beamform_backend(backend)
+    if resolved == "mach":
+        return beamform_iq_mach(iq_frames, tx_delays, tx_delays_elev, config)
+    return beamform_iq_mlx(
+        iq_frames,
+        tx_delays,
+        tx_delays_elev,
+        config,
+        scan_chunk=scan_chunk,
+        receive_chunk=receive_chunk,
+        frame_chunk=frame_chunk,
+    )
 
 
 # --------------------------------------------------------------------------- #

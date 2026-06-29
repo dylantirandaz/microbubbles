@@ -23,6 +23,11 @@ mach = [
   "cupy",
 ]
 
+# Apple Silicon beamforming backend. Uses MLX/Metal instead of CUDA/MACH.
+mlx = [
+  "mlx",
+]
+
 [project.scripts]
 ultratrace-ulm = "ultratrace_ulm.cli:main"
 

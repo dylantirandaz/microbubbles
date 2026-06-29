@@ -24,6 +24,7 @@ from .beamform_core import (
     NeutralConfig,
     beamform_iq,
     compute_global_tgc,
+    resolve_beamform_backend,
 )
 
 
@@ -45,6 +46,10 @@ class BeamformOptions:
     tgc_acqs: int = 12
     tgc_sigma_lambda: float = 9.0
     tgc_svd_cut: float = 0.05
+    backend: str = "auto"
+    mlx_scan_chunk: int = 2048
+    mlx_rx_chunk: int = 128
+    mlx_frame_chunk: int = 16
     resume: bool = False
     dry_run: bool = False
 
@@ -108,8 +113,9 @@ def _write_acq(out: h5py.File, out_id: int, compound: np.ndarray, grid) -> None:
 
 def beamform_mach(opts: BeamformOptions) -> Path:
     if opts.dry_run:
-        print("MACH beamforming dry run only; no output written.")
+        print("Beamforming dry run only; no output written.")
         return opts.output_path
+    backend = resolve_beamform_backend(opts.backend)
 
     with h5py.File(opts.input_path, "r") as h5:
         config = _load_neutral_config(h5, opts)
@@ -120,8 +126,17 @@ def beamform_mach(opts: BeamformOptions) -> Path:
         grids: dict[int, object] = {}
         for acq_id in ids:
             iq, txd, txd_elev = _load_acq(h5, acq_id)
-            print(f"[beamform] acq {acq_id}: iq {iq.shape} -> mach", flush=True)
-            compound, grid = beamform_iq(iq, txd, txd_elev, config)
+            print(f"[beamform] acq {acq_id}: iq {iq.shape} -> {backend}", flush=True)
+            compound, grid = beamform_iq(
+                iq,
+                txd,
+                txd_elev,
+                config,
+                backend=backend,
+                scan_chunk=opts.mlx_scan_chunk,
+                receive_chunk=opts.mlx_rx_chunk,
+                frame_chunk=opts.mlx_frame_chunk,
+            )
             compounds[acq_id] = compound
             grids[acq_id] = grid
             print(f"[beamform] acq {acq_id}: compound {compound.shape}", flush=True)
@@ -147,7 +162,7 @@ def beamform_mach(opts: BeamformOptions) -> Path:
     opts.output_path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(opts.output_path, "w") as out:
         out.attrs["description"] = (
-            f"MACH-beamformed neutral ultratrace from {opts.input_path.name} "
+            f"{backend.upper()}-beamformed neutral ultratrace from {opts.input_path.name} "
             f"(z/x coarseness {opts.z_coarseness}, elev {opts.elev_planes}, "
             f"large_fov {opts.large_fov}, spatial_tgc {opts.spatial_tgc})"
         )
@@ -178,6 +193,10 @@ def make_options(args) -> BeamformOptions:
         tgc_acqs=args.tgc_acqs,
         tgc_sigma_lambda=args.tgc_sigma_lambda,
         tgc_svd_cut=args.tgc_svd_cut,
+        backend=getattr(args, "backend", "auto"),
+        mlx_scan_chunk=getattr(args, "mlx_scan_chunk", 2048),
+        mlx_rx_chunk=getattr(args, "mlx_rx_chunk", 128),
+        mlx_frame_chunk=getattr(args, "mlx_frame_chunk", 16),
         resume=args.resume,
         dry_run=args.dry_run,
     )
